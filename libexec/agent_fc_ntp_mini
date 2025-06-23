@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+# -*- encoding: utf-8; py-indent-offset: 4 -*-
+
+# +------------------------------------------------------------+
+# |                                                            |
+# |             | |             | |            | |             |
+# |          ___| |__   ___  ___| | ___ __ ___ | | __          |
+# |         / __| '_ \ / _ \/ __| |/ / '_ ` _ \| |/ /          |
+# |        | (__| | | |  __/ (__|   <| | | | | |   <           |
+# |         \___|_| |_|\___|\___|_|\_\_| |_| |_|_|\_\          |
+# |                                 custom code by Meik Vogel  |
+# |                                                            |
+# +------------------------------------------------------------+
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   Copyright (C) 2025  uvitas eGbR
+#                       by meik.vogel@uvitas.de
+
+import sys
+import requests
+import base64
+import re
+from urllib.parse import urlparse
+from xml.etree import ElementTree as ET
+
+def fetch(url: str, username: str, password: str) -> str:
+    headers = {
+        "Authorization": "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+    }
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+
+    response = requests.get(
+        url,
+        headers=headers,
+        proxies={"no_proxy": hostname},
+        timeout=10
+    )
+    response.trust_env = False
+    response.raise_for_status()
+    return response.text
+
+def parse_time_xml(xml_text: str) -> dict:
+    tree = ET.fromstring(xml_text)
+    return {
+        "runtime": tree.findtext("rtime", default="N/A").strip(),
+        "current_time_utc": tree.findtext("ctime", default="N/A").strip(),
+    }
+
+def parse_gnss_xml(xml_text: str) -> dict:
+    tree = ET.fromstring(xml_text)
+    return {
+        "ant": tree.findtext("ant", default="N/A").strip(),
+        "const": tree.findtext("const", default="N/A").strip(),
+        "svused": tree.findtext("svused", default="N/A").strip(),
+        "gpsinfo": tree.findtext("gpsinfo", default="N/A").strip(),
+        "bdinfo": tree.findtext("bdinfo", default="N/A").strip(),
+        "glinfo": tree.findtext("glinfo", default="N/A").strip(),
+        "lat": tree.findtext("lat", default="N/A").strip(),
+        "long": tree.findtext("long", default="N/A").strip(),
+        "alt": tree.findtext("alt", default="N/A").strip(),
+    }
+
+def parse_ntpstate_html(html: str) -> dict:
+    values = {}
+    value_list = []
+
+    # Alle <tr>...</tr> Blöcke finden
+    rows = re.findall(r"<tr.*?>(.*?)</tr>", html, re.DOTALL | re.IGNORECASE)
+
+    for row in rows:
+        # Alle <td>...</td> in der Zeile finden
+        tds = re.findall(r"<td.*?>(.*?)</td>", row, re.DOTALL | re.IGNORECASE)
+
+        # Falls nur eine TD und ein <textarea> in der Zeile, abbrechen
+        if len(tds) == 1 and re.search(r"<textarea.*?>", row, re.IGNORECASE):
+            break
+
+        # Wenn 0 oder 1 TD, überspringen
+        if len(tds) <= 1:
+            continue
+
+        # Inhalt der 2. TD (Index 1) ohne HTML-Tags und whitespace
+        value = re.sub(r"<.*?>", "", tds[1]).strip()
+        value_list.append(value)
+
+    if len(value_list) >= 3:
+        values["ntp_server_status"] = value_list[0]
+        values["ntp_port"] = value_list[1]
+        values["ntp_stratum"] = value_list[2]
+
+    # Textarea-Inhalt extrahieren
+    textarea_match = re.search(r"<textarea.*?>(.*?)</textarea>", html, re.DOTALL | re.IGNORECASE)
+    if textarea_match:
+        textarea_content = textarea_match.group(1).strip()
+        accesses = [line.strip() for line in textarea_content.splitlines() if line.strip()]
+        values["ntp_client_count"] = str(len(accesses))
+        if accesses:
+            values["ntp_last_client"] = accesses[0].split('\t')[-1]
+        else:
+            values["ntp_last_client"] = "N/A"
+
+    return values
+
+def parse_runtime_to_seconds(runtime_str: str) -> int:
+    days = hours = minutes = seconds = 0
+    day_match = re.search(r"(\d+)\s*Day", runtime_str)
+    time_match = re.search(r"(\d+):(\d+):(\d+)", runtime_str)
+
+    if day_match:
+        days = int(day_match.group(1))
+    if time_match:
+        hours = int(time_match.group(1))
+        minutes = int(time_match.group(2))
+        seconds = int(time_match.group(3))
+
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+def main():
+    if len(sys.argv) != 4:
+        print("Usage: agent_fc_ntp_mini <host> <username> <password>", file=sys.stderr)
+        sys.exit(1)
+
+    host, user, pwd = sys.argv[1:4]
+    base_url = f"http://{host}"
+    uptime_seconds = None
+
+    print("<<<fc_ntp_mini>>>")
+    try:
+        time_xml = fetch(f"{base_url}/xml/time.xml", user, pwd)
+        time_data = parse_time_xml(time_xml)
+        for k, v in time_data.items():
+            if k != "runtime":
+                print(f"{k}: {v}")
+        if "runtime" in time_data:
+            uptime_seconds = parse_runtime_to_seconds(time_data["runtime"])
+    except Exception as e:
+        print(f"error_time: {e}")
+
+    try:
+        gnss_xml = fetch(f"{base_url}/xml/gnss.xml", user, pwd)
+        gnss_data = parse_gnss_xml(gnss_xml)
+        for k, v in gnss_data.items():
+            print(f"{k}: {v}")
+    except Exception as e:
+        print(f"error_gnss: {e}")
+
+    try:
+        ntp_html = fetch(f"{base_url}/ntpstate.shtml", user, pwd)
+        ntp_data = parse_ntpstate_html(ntp_html)
+        for k, v in ntp_data.items():
+            print(f"{k}: {v}")
+    except Exception as e:
+        print(f"error_ntp: {e}")
+
+    if uptime_seconds is not None:
+        print("<<<uptime>>>")
+        print(uptime_seconds)
+
+if __name__ == "__main__":
+    main()
+
